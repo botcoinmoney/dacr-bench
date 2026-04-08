@@ -1,0 +1,17 @@
+You are given a technical document and a set of questions. For each question, find the answer in the document and state where you found it.
+
+For each answer, also provide a confidence score between 0.0 and 1.0 indicating how confident you are in your answer, where 0.0 means pure guess and 1.0 means absolutely certain.
+
+Document:
+{document}
+
+Questions:
+{questions}
+
+Respond with ONLY a JSON object. No explanation, no reasoning, no preamble.
+For each question, provide the answer, a brief citation, and your confidence score.
+
+{
+  "q01": {"answer": "...", "citation": "...", "confidence": 0.95},
+  "q02": {"answer": "...", "citation": "...", "confidence": 0.8}
+}
