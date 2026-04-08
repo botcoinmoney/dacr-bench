@@ -149,7 +149,7 @@ npx tsx src/run.ts \
 ```
 
 ### Python Runner
-A Python runner is also available in the [evaluation results repo](https://github.com/botcoinmoney/synthetic-reasoning-transfer):
+A Python runner is also available in the [evaluation results repo](https://github.com/botcoinmoney/synthetic-to-real-reasoning):
 
 ```bash
 python run_benchmark.py \
@@ -206,7 +206,7 @@ All challenges undergo deterministic verification: every gold answer must be ext
 ## Related
 
 - **Fine-tuning results:** [botcoinmoney/dacr-bench-results](https://huggingface.co/datasets/botcoinmoney/dacr-bench-results) on HuggingFace
-- **Training & evaluation code:** [botcoinmoney/synthetic-reasoning-transfer](https://github.com/botcoinmoney/synthetic-reasoning-transfer)
+- **Training & evaluation code:** [botcoinmoney/synthetic-to-real-reasoning](https://github.com/botcoinmoney/synthetic-to-real-reasoning)
 - **Training data:** [botcoinmoney/domain-agnostic-causal-reasoning-tuning](https://huggingface.co/datasets/botcoinmoney/domain-agnostic-causal-reasoning-tuning) on HuggingFace
 
 ## Citation
@@ -216,6 +216,6 @@ All challenges undergo deterministic verification: every gold answer must be ext
   title={DACR-Bench: Domain-Agnostic Causal Reasoning Benchmark},
   author={botcoinmoney},
   year={2026},
-  url={https://github.com/botcoinmoney/DACR-benchmark}
+  url={https://github.com/botcoinmoney/dacr-bench}
 }
 ```
