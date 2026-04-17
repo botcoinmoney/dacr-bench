@@ -9,11 +9,13 @@ import * as fs from "fs";
 import type {
   BenchmarkChallenge,
   BenchmarkQuestion,
+  BenchmarkSplit,
   ModelPrediction,
   ModelAnswer,
   QuestionScore,
   ChallengeScore,
   BenchmarkResults,
+  SplitSummary,
   QuestionCategory,
 } from "./types.js";
 
@@ -95,11 +97,7 @@ function scoreCitation(
   return 0;
 }
 
-// ── Causal Authority Resolution ──
-// When a document contains conflicting information (e.g., a preliminary estimate
-// vs. a final reported result), the model must determine which value is causally
-// authoritative. This measures the model's ability to resolve information conflicts
-// by identifying the source that reflects the actual outcome or measurement.
+// ── Trap Scoring ──
 
 function scoreTrapEvasion(
   modelAnswer: string,
@@ -116,9 +114,17 @@ function scoreTrapEvasion(
   const correctNorm = normalize(String(trap.correctValue));
   const wrongNorm = normalize(String(trap.wrongValue));
 
-  if (modelNorm.includes(correctNorm)) return true;  // used authoritative value
-  if (modelNorm.includes(wrongNorm)) return false;    // used conflicting value
+  if (modelNorm.includes(correctNorm)) return true;  // avoided trap
+  if (modelNorm.includes(wrongNorm)) return false;    // fell for trap
   return undefined; // wrong for other reasons
+}
+
+// ── Split Inference ──
+
+/** Determine split from challenge — uses explicit field or infers from source type */
+function inferSplit(challenge: BenchmarkChallenge): BenchmarkSplit {
+  if ((challenge as any).split) return (challenge as any).split;
+  return challenge.source.type === "engine" ? "synthetic" : "real";
 }
 
 // ── Confidence Calibration ──
@@ -270,9 +276,9 @@ export function evaluate(
 
   // Hop breakdown
   const byHops: Record<string, { accuracy: number; meanConfidence: number; count: number }> = {};
-  for (const hopLabel of ["1", "2", "3", "4+"]) {
+  for (const hopLabel of ["1", "2", "3", "4", "5", "6+"]) {
     const qs = allQuestionScores.filter((s) =>
-      hopLabel === "4+" ? s.hops >= 4 : s.hops === parseInt(hopLabel)
+      hopLabel === "6+" ? s.hops >= 6 : s.hops === parseInt(hopLabel)
     );
     if (qs.length === 0) continue;
     byHops[hopLabel] = {
@@ -302,6 +308,36 @@ export function evaluate(
       count: qs.length,
     };
   }
+
+  // Split breakdown
+  const bySplit: Record<string, SplitSummary> = {};
+  for (const split of ["real", "synthetic"] as BenchmarkSplit[]) {
+    const splitChallenges = challenges.filter((c) => inferSplit(c) === split);
+    const splitScores = challengeScores.filter((cs) =>
+      splitChallenges.some((c) => c.challengeId === cs.challengeId)
+    );
+    const splitQs = splitScores.flatMap((s) => s.questionScores);
+    if (splitQs.length === 0) continue;
+
+    const splitTrapQs = splitQs.filter((q) => q.trapEvasion !== undefined);
+    bySplit[split] = {
+      answerAccuracy: splitQs.filter((q) => q.correct).length / splitQs.length,
+      meanConfidence: splitQs.reduce((s, q) => s + q.confidenceScore, 0) / splitQs.length,
+      trapEvasionRate: splitTrapQs.length > 0
+        ? splitTrapQs.filter((q) => q.trapEvasion === true).length / splitTrapQs.length
+        : 1,
+      passRate: splitScores.length > 0
+        ? splitScores.filter((c) => c.passed).length / splitScores.length
+        : 0,
+      challengeCount: splitScores.length,
+      questionCount: splitQs.length,
+    };
+  }
+
+  // Transfer gap: |AA_real - AA_synthetic|
+  const transferGap = (bySplit.real && bySplit.synthetic)
+    ? Math.abs(bySplit.real.answerAccuracy - bySplit.synthetic.answerAccuracy)
+    : undefined;
 
   // Summary
   const totalQuestions = allQuestionScores.length;
@@ -341,6 +377,8 @@ export function evaluate(
     byDomain,
     byHops,
     byDifficulty,
+    bySplit: Object.keys(bySplit).length > 0 ? bySplit as any : undefined,
+    transferGap,
     challengeScores,
   };
 }
@@ -360,7 +398,7 @@ export function generateReport(results: BenchmarkResults): string {
   report += `| Confidence-Weighted Accuracy | ${(s.confidenceWeightedAccuracy * 100).toFixed(1)}% |\n`;
   report += `| Confidence Calibration (ECE) | ${s.confidenceCalibration.toFixed(3)} |\n`;
   report += `| Mean Confidence | ${(s.meanConfidence * 100).toFixed(1)}% |\n`;
-  report += `| Causal Authority Resolution | ${(s.trapEvasionRate * 100).toFixed(1)}% |\n`;
+  report += `| Trap Evasion Rate | ${(s.trapEvasionRate * 100).toFixed(1)}% |\n`;
   report += `| Citation Grounding | ${(s.citationGroundingScore * 100).toFixed(1)}% |\n`;
   report += `| Challenge Pass Rate | ${(s.passRate * 100).toFixed(1)}% |\n`;
   report += `| Format Failure Rate | ${(s.formatFailureRate * 100).toFixed(1)}% |\n\n`;
@@ -389,6 +427,18 @@ export function generateReport(results: BenchmarkResults): string {
     report += `| ${diff} | ${(data.accuracy * 100).toFixed(1)}% | ${(data.meanConfidence * 100).toFixed(1)}% | ${data.count} |\n`;
   }
 
+  if (results.bySplit && Object.keys(results.bySplit).length > 0) {
+    report += `\n## By Split (Real vs Synthetic)\n\n`;
+    report += `| Split | Accuracy | Confidence | Trap Evasion | Pass Rate | Challenges | Questions |\n|---|---|---|---|---|---|---|\n`;
+    for (const [split, data] of Object.entries(results.bySplit)) {
+      report += `| ${split} | ${(data.answerAccuracy * 100).toFixed(1)}% | ${(data.meanConfidence * 100).toFixed(1)}% | ${(data.trapEvasionRate * 100).toFixed(1)}% | ${(data.passRate * 100).toFixed(1)}% | ${data.challengeCount} | ${data.questionCount} |\n`;
+    }
+    if (results.transferGap !== undefined) {
+      report += `\n**Transfer Gap:** ${(results.transferGap * 100).toFixed(1)}pp`;
+      report += ` (|AA_real - AA_synthetic| — lower means synthetic performance predicts real-doc performance)\n`;
+    }
+  }
+
   return report;
 }
 
@@ -399,20 +449,34 @@ if (process.argv[1]?.endsWith("evaluate.ts")) {
   const benchIdx = args.indexOf("--benchmark");
   const predIdx = args.indexOf("--predictions");
   const outIdx = args.indexOf("--output");
+  const splitIdx = args.indexOf("--split");
 
   if (benchIdx === -1 || predIdx === -1) {
-    console.error("Usage: npx tsx DACR_benchmark/src/evaluate.ts --benchmark <challenges.json> --predictions <predictions.json> [--output <results.json>]");
+    console.error("Usage: npx tsx src/evaluate.ts --benchmark <challenges.json> --predictions <predictions.json> [--output <results.json>] [--split real|synthetic|all]");
     process.exit(1);
   }
 
-  const challenges: BenchmarkChallenge[] = JSON.parse(fs.readFileSync(args[benchIdx + 1], "utf-8"));
+  let challenges: BenchmarkChallenge[] = JSON.parse(fs.readFileSync(args[benchIdx + 1], "utf-8"));
+
+  // Handle BenchmarkDataset wrapper (has .challenges array) vs raw array
+  if (!Array.isArray(challenges) && (challenges as any).challenges) {
+    challenges = (challenges as any).challenges;
+  }
+
   const predictions: ModelPrediction[] = JSON.parse(fs.readFileSync(args[predIdx + 1], "utf-8"));
-  const outputPath = outIdx !== -1 ? args[outIdx + 1] : "DACR_benchmark/results/results.json";
+  const outputPath = outIdx !== -1 ? args[outIdx + 1] : "results/results.json";
+  const splitFilter = splitIdx !== -1 ? args[splitIdx + 1] as "real" | "synthetic" | "all" : "all";
+
+  // Filter by split if requested
+  if (splitFilter !== "all") {
+    challenges = challenges.filter((c) => inferSplit(c) === splitFilter);
+    console.log(`Filtered to ${splitFilter} split: ${challenges.length} challenges\n`);
+  }
 
   const results = evaluate(challenges, predictions);
   const report = generateReport(results);
 
-  fs.mkdirSync("DACR_benchmark/results", { recursive: true });
+  fs.mkdirSync("results", { recursive: true });
   fs.writeFileSync(outputPath, JSON.stringify(results, null, 2));
   fs.writeFileSync(outputPath.replace(".json", ".md"), report);
 

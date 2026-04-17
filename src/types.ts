@@ -76,12 +76,17 @@ export interface BenchmarkQuestion {
   difficulty: "easy" | "medium" | "hard";
 }
 
+// ── Split Label ──
+
+export type BenchmarkSplit = "real" | "synthetic";
+
 // ── Benchmark Challenge (one document + questions) ──
 
 export interface BenchmarkChallenge {
   challengeId: string;
   version: string;
   source: ChallengeSource;
+  split: BenchmarkSplit;
   document: {
     text: string;
     domain: string;
@@ -168,6 +173,15 @@ export interface ChallengeScore {
   questionScores: QuestionScore[];
 }
 
+export interface SplitSummary {
+  answerAccuracy: number;
+  meanConfidence: number;
+  trapEvasionRate: number;
+  passRate: number;
+  challengeCount: number;
+  questionCount: number;
+}
+
 export interface BenchmarkResults {
   model: string;
   benchmarkVersion: string;
@@ -188,6 +202,8 @@ export interface BenchmarkResults {
   byDomain: Record<string, { accuracy: number; meanConfidence: number; count: number }>;
   byHops: Record<string, { accuracy: number; meanConfidence: number; count: number }>;
   byDifficulty: Record<string, { accuracy: number; meanConfidence: number; count: number }>;
+  bySplit?: Record<BenchmarkSplit, SplitSummary>;
+  transferGap?: number; // |AA_real - AA_synthetic| — lower means synthetic predicts real well
   challengeScores: ChallengeScore[];
 }
 
@@ -201,6 +217,7 @@ export interface BenchmarkDataset {
   challenges: BenchmarkChallenge[];
   domainBreakdown: Record<string, number>;
   categoryBreakdown: Record<QuestionCategory, number>;
+  splitBreakdown: Record<BenchmarkSplit, number>;
   stats: {
     totalChallenges: number;
     totalQuestions: number;

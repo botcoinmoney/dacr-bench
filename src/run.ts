@@ -12,7 +12,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { execSync } from "child_process";
-import type { BenchmarkChallenge, ModelPrediction, ModelAnswer } from "./types.js";
+import type { BenchmarkChallenge, BenchmarkSplit, ModelPrediction, ModelAnswer } from "./types.js";
 
 // ── Prompt Template ──
 // NOTE: No conflicting information warning — deliberately removed per benchmark design
@@ -54,6 +54,8 @@ export interface RunConfig {
   outputPath: string;
   /** Max challenges to run (for quick testing) */
   limit?: number;
+  /** Filter to specific split */
+  split?: BenchmarkSplit | "all";
 }
 
 // ── Prompt Formatting ──
@@ -181,10 +183,21 @@ function parseResponse(
 
 // ── Main Runner ──
 
+/** Infer split from challenge source type if not explicitly set */
+function inferSplit(challenge: BenchmarkChallenge): BenchmarkSplit {
+  if ((challenge as any).split) return (challenge as any).split;
+  return challenge.source.type === "engine" ? "synthetic" : "real";
+}
+
 export async function runBenchmark(config: RunConfig): Promise<ModelPrediction[]> {
-  const challenges: BenchmarkChallenge[] = JSON.parse(
-    fs.readFileSync(config.benchmarkPath, "utf-8")
-  );
+  let rawData: any = JSON.parse(fs.readFileSync(config.benchmarkPath, "utf-8"));
+  let challenges: BenchmarkChallenge[] = Array.isArray(rawData) ? rawData : rawData.challenges ?? rawData;
+
+  // Filter by split
+  if (config.split && config.split !== "all") {
+    challenges = challenges.filter((c) => inferSplit(c) === config.split);
+    console.log(`Filtered to ${config.split} split: ${challenges.length} challenges`);
+  }
 
   const limit = config.limit ?? challenges.length;
   const temperature = config.temperature ?? 0.1;
@@ -283,10 +296,11 @@ if (process.argv[1]?.endsWith("run.ts")) {
   const temperature = parseFloat(get("--temperature") ?? "0.1");
   const timeout = parseInt(get("--timeout") ?? "120");
   const limit = get("--limit") ? parseInt(get("--limit")!) : undefined;
-  const outputPath = get("--output") ?? `DACR_benchmark/results/predictions_${model.replace(/\//g, "_")}.json`;
+  const split = (get("--split") ?? "all") as "real" | "synthetic" | "all";
+  const outputPath = get("--output") ?? `results/predictions_${model.replace(/\//g, "_")}.json`;
 
   if (!benchmarkPath) {
-    console.error(`Usage: npx tsx DACR_benchmark/src/run.ts --benchmark <path> [options]
+    console.error(`Usage: npx tsx src/run.ts --benchmark <path> [options]
 
 Options:
   --model <name>       Model identifier (default: sonnet)
@@ -295,6 +309,7 @@ Options:
   --temperature <n>    Inference temperature (default: 0.1)
   --timeout <secs>     Timeout per challenge (default: 120)
   --limit <n>          Max challenges to run
+  --split <type>       real, synthetic, or all (default: all)
   --output <path>      Output predictions file`);
     process.exit(1);
   }
@@ -308,5 +323,6 @@ Options:
     timeoutSeconds: timeout,
     outputPath,
     limit,
+    split,
   });
 }
