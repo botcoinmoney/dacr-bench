@@ -34,6 +34,9 @@ function matchAnswer(modelAnswer: string, question: BenchmarkQuestion): MatchTyp
   const modelNorm = normalize(modelAnswer);
   const goldNorm = normalize(question.goldAnswer);
 
+  // Empty or missing answer is never correct
+  if (!modelNorm || !goldNorm) return "none";
+
   // Exact match
   if (modelNorm === goldNorm) return "exact";
 
@@ -51,8 +54,9 @@ function matchAnswer(modelAnswer: string, question: BenchmarkQuestion): MatchTyp
   if (modelNorm.includes(goldNorm) || goldNorm.includes(modelNorm)) return "partial";
 
   // Token-level overlap
-  const modelTokens = new Set(modelNorm.split(/\s+/));
-  const goldTokens = new Set(goldNorm.split(/\s+/));
+  const modelTokens = new Set(modelNorm.split(/\s+/).filter((t) => t.length > 0));
+  const goldTokens = new Set(goldNorm.split(/\s+/).filter((t) => t.length > 0));
+  if (modelTokens.size === 0 || goldTokens.size === 0) return "none";
   const intersection = [...modelTokens].filter((t) => goldTokens.has(t));
   const f1 = (2 * intersection.length) / (modelTokens.size + goldTokens.size);
   if (f1 >= 0.8) return "partial";
