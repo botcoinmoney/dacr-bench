@@ -46,6 +46,8 @@ export interface RunConfig {
   runner: "claude-cli" | "http";
   /** HTTP endpoint for local models (only for runner=http) */
   endpoint?: string;
+  /** API key for authenticated endpoints */
+  apiKey?: string;
   /** Temperature for inference */
   temperature?: number;
   /** Timeout per challenge in seconds */
@@ -103,34 +105,65 @@ function runHTTP(
   endpoint: string,
   model: string,
   temperature: number,
-  timeoutMs: number
+  timeoutMs: number,
+  apiKey?: string
 ): string {
   const payload = JSON.stringify({
     model,
     messages: [{ role: "user", content: prompt }],
     temperature,
-    max_tokens: 2000,
+    max_tokens: 4000,
   });
 
   const tmpPayload = `/tmp/dacr_payload_${crypto.randomBytes(4).toString("hex")}.json`;
   fs.writeFileSync(tmpPayload, payload);
 
-  try {
-    const result = execSync(
-      `curl -s -X POST "${endpoint}" -H "Content-Type: application/json" -d @"${tmpPayload}" --max-time ${Math.ceil(timeoutMs / 1000)}`,
-      { maxBuffer: 10 * 1024 * 1024, timeout: timeoutMs + 5000 }
-    );
+  const maxRetries = 3;
 
-    const parsed = JSON.parse(result.toString());
-    // OpenAI-compatible format
-    if (parsed.choices?.[0]?.message?.content) {
-      return parsed.choices[0].message.content;
+  try {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      const result = execSync(
+        `curl -s -X POST "${endpoint}" -H "Content-Type: application/json"${apiKey ? ` -H "Authorization: Bearer ${apiKey}"` : ""} -d @"${tmpPayload}" --max-time ${Math.ceil(timeoutMs / 1000)}`,
+        { maxBuffer: 10 * 1024 * 1024, timeout: timeoutMs + 5000 }
+      );
+
+      let responseBody: any;
+      try {
+        responseBody = JSON.parse(result.toString());
+      } catch {
+        // Response isn't JSON — could be raw text from some endpoints
+        return result.toString().trim();
+      }
+
+      // Handle array-wrapped responses (some APIs wrap in [])
+      if (Array.isArray(responseBody)) {
+        responseBody = responseBody[0];
+      }
+
+      // Check for rate-limit / quota errors and retry with backoff
+      if (responseBody.error) {
+        const code = responseBody.error.code ?? responseBody.error.status;
+        if ((code === 429 || code === "RESOURCE_EXHAUSTED") && attempt < maxRetries - 1) {
+          const retryMatch = JSON.stringify(responseBody).match(/retry.*?(\d+)/i);
+          const waitSecs = retryMatch ? Math.min(parseInt(retryMatch[1]) + 5, 120) : 30 * (attempt + 1);
+          console.warn(`  Rate limited, waiting ${waitSecs}s before retry ${attempt + 2}/${maxRetries}...`);
+          execSync(`sleep ${waitSecs}`);
+          continue;
+        }
+        throw new Error(`API error: ${responseBody.error.message ?? JSON.stringify(responseBody.error)}`);
+      }
+
+      // OpenAI-compatible format
+      if (responseBody.choices?.[0]?.message?.content) {
+        return responseBody.choices[0].message.content;
+      }
+      // Anthropic format
+      if (responseBody.content?.[0]?.text) {
+        return responseBody.content[0].text;
+      }
+      return result.toString();
     }
-    // Anthropic format
-    if (parsed.content?.[0]?.text) {
-      return parsed.content[0].text;
-    }
-    return result.toString();
+    throw new Error("Max retries exceeded");
   } finally {
     try { fs.unlinkSync(tmpPayload); } catch {}
   }
@@ -138,47 +171,158 @@ function runHTTP(
 
 // ── Response Parsing ──
 
-function parseResponse(
-  raw: string,
-  challenge: BenchmarkChallenge
-): Record<string, ModelAnswer> {
-  // Strip markdown code fences
+/**
+ * Attempt to parse JSON response (strict mode).
+ * Returns null if no valid JSON found.
+ */
+function tryParseJSON(raw: string): Record<string, any> | null {
   let cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "");
 
-  // Extract first JSON object
   const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    throw new Error("No JSON object found in response");
-  }
+  if (!jsonMatch) return null;
 
-  let parsed: Record<string, any>;
   try {
-    parsed = JSON.parse(jsonMatch[0]);
+    return JSON.parse(jsonMatch[0]);
   } catch {
     // Try to fix common JSON issues
     const fixed = jsonMatch[0]
       .replace(/'/g, '"')
       .replace(/,\s*}/g, "}")
       .replace(/,\s*]/g, "]");
-    parsed = JSON.parse(fixed);
+    try {
+      return JSON.parse(fixed);
+    } catch {
+      return null;
+    }
   }
+}
 
+/**
+ * Detect API error responses that masquerade as valid JSON.
+ * Returns true if the response is an error, not a model answer.
+ */
+function isErrorResponse(parsed: Record<string, any>): boolean {
+  return !!parsed.error || !!parsed.message && !!parsed.code;
+}
+
+/**
+ * Flexible answer extraction from unstructured text.
+ * Looks for patterns like "q01: answer" or "1. answer" or numbered responses.
+ * Falls back to extracting answer-like content per question.
+ */
+function extractFromProse(
+  raw: string,
+  challenge: BenchmarkChallenge
+): Record<string, ModelAnswer> {
   const answers: Record<string, ModelAnswer> = {};
+  const lines = raw.split("\n");
+
   for (const q of challenge.questions) {
-    const entry = parsed[q.questionId];
-    if (!entry) {
-      answers[q.questionId] = { answer: "", citation: "", confidence: 0 };
-      continue;
+    const qIdx = parseInt(q.questionId.replace("q", ""));
+    let answer = "";
+    let citation = "";
+    let confidence = 0.5; // default confidence for unstructured responses
+
+    // Strategy 1: Look for "q01:" or "[q01]" pattern
+    const qPattern = new RegExp(`(?:${q.questionId}|\\[${q.questionId}\\])\\s*[:\\-]\\s*(.+)`, "i");
+    for (const line of lines) {
+      const match = line.match(qPattern);
+      if (match) {
+        answer = match[1].trim();
+        break;
+      }
     }
 
-    answers[q.questionId] = {
-      answer: String(entry.answer ?? entry.Answer ?? ""),
-      citation: String(entry.citation ?? entry.Citation ?? ""),
-      confidence: Math.max(0, Math.min(1, parseFloat(entry.confidence ?? entry.Confidence ?? "0") || 0)),
-    };
+    // Strategy 2: Look for numbered pattern "1." or "1)" matching question index
+    if (!answer) {
+      const numPattern = new RegExp(`^\\s*${qIdx}[.)\\]]\\s*(.+)`, "m");
+      const numMatch = raw.match(numPattern);
+      if (numMatch) {
+        answer = numMatch[1].trim();
+      }
+    }
+
+    // Strategy 3: Look for the question text echoed back followed by an answer
+    if (!answer) {
+      const questionWords = q.text.split(/\s+/).slice(0, 5).join("\\s+");
+      const echoPattern = new RegExp(questionWords + "[^\\n]*\\n+\\s*(?:Answer:\\s*)?(.+)", "i");
+      const echoMatch = raw.match(echoPattern);
+      if (echoMatch) {
+        answer = echoMatch[1].trim();
+      }
+    }
+
+    // Extract citation if present near the answer
+    if (answer) {
+      const citMatch = answer.match(/\(([^)]+(?:section|paragraph|page|table|figure)[^)]*)\)/i)
+        || answer.match(/(?:citation|source|ref|found in)[:\s]+(.+?)(?:\.|$)/i);
+      if (citMatch) {
+        citation = citMatch[1].trim();
+        // Remove citation from answer
+        answer = answer.replace(citMatch[0], "").trim();
+      }
+    }
+
+    // Extract confidence if stated
+    const confMatch = raw.match(new RegExp(`${q.questionId}[^}]*confidence[:\\s]+([0-9.]+)`, "i"));
+    if (confMatch) {
+      confidence = Math.max(0, Math.min(1, parseFloat(confMatch[1]) || 0.5));
+    }
+
+    answers[q.questionId] = { answer, citation, confidence };
   }
 
   return answers;
+}
+
+/**
+ * Parse model response with multi-strategy extraction.
+ * Priority: JSON > flexible key matching > prose extraction
+ */
+function parseResponse(
+  raw: string,
+  challenge: BenchmarkChallenge
+): Record<string, ModelAnswer> {
+  // Strategy 1: Try strict JSON parse
+  const parsed = tryParseJSON(raw);
+
+  if (parsed && !isErrorResponse(parsed)) {
+    // Check if the JSON has the expected question keys
+    const answers: Record<string, ModelAnswer> = {};
+    let foundAny = false;
+
+    for (const q of challenge.questions) {
+      // Try exact key, then numeric key, then index-based key
+      const entry = parsed[q.questionId]
+        ?? parsed[q.questionId.toUpperCase()]
+        ?? parsed[q.questionId.replace("q", "Q")]
+        ?? parsed[String(parseInt(q.questionId.replace("q", "")))]
+        ?? parsed[`question_${q.questionId.replace("q", "")}`];
+
+      if (!entry) {
+        answers[q.questionId] = { answer: "", citation: "", confidence: 0 };
+        continue;
+      }
+
+      foundAny = true;
+      answers[q.questionId] = {
+        answer: String(entry.answer ?? entry.Answer ?? entry.response ?? entry.Response ?? ""),
+        citation: String(entry.citation ?? entry.Citation ?? entry.source ?? entry.Source ?? entry.reference ?? ""),
+        confidence: Math.max(0, Math.min(1, parseFloat(entry.confidence ?? entry.Confidence ?? "0.5") || 0.5)),
+      };
+    }
+
+    if (foundAny) return answers;
+  }
+
+  // Strategy 2: Prose/freeform extraction
+  const proseAnswers = extractFromProse(raw, challenge);
+  const proseFound = Object.values(proseAnswers).filter((a) => a.answer).length;
+
+  if (proseFound > 0) return proseAnswers;
+
+  // Strategy 3: Nothing worked
+  throw new Error("No answers extractable from response (tried JSON and prose parsing)");
 }
 
 // ── Main Runner ──
@@ -219,7 +363,7 @@ export async function runBenchmark(config: RunConfig): Promise<ModelPrediction[]
       if (config.runner === "claude-cli") {
         raw = runClaudeCLI(prompt, config.model, timeoutMs);
       } else {
-        raw = runHTTP(prompt, config.endpoint!, config.model, temperature, timeoutMs);
+        raw = runHTTP(prompt, config.endpoint!, config.model, temperature, timeoutMs, config.apiKey);
       }
     } catch (e: any) {
       console.warn(`  FAILED: ${e.message}`);
@@ -297,6 +441,7 @@ if (process.argv[1]?.endsWith("run.ts")) {
   const timeout = parseInt(get("--timeout") ?? "120");
   const limit = get("--limit") ? parseInt(get("--limit")!) : undefined;
   const split = (get("--split") ?? "all") as "real" | "synthetic" | "all";
+  const apiKey = get("--api-key");
   const outputPath = get("--output") ?? `results/predictions_${model.replace(/\//g, "_")}.json`;
 
   if (!benchmarkPath) {
@@ -319,6 +464,7 @@ Options:
     model,
     runner,
     endpoint,
+    apiKey,
     temperature,
     timeoutSeconds: timeout,
     outputPath,
