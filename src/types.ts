@@ -113,6 +113,8 @@ export interface ModelAnswer {
   confidence: number; // 0.0 to 1.0 — required
 }
 
+export type ParseFormat = "json" | "trace" | "prose" | "failed";
+
 export interface ModelPrediction {
   challengeId: string;
   model: string;
@@ -123,6 +125,7 @@ export interface ModelPrediction {
     tokensGenerated: number;
     temperature: number;
     formatFailures: number;
+    parseFormat?: ParseFormat; // Which format was successfully parsed
   };
 }
 
@@ -182,6 +185,12 @@ export interface SplitSummary {
   questionCount: number;
 }
 
+export interface FormatBreakdown {
+  count: number;      // Number of challenges parsed with this format
+  accuracy: number;   // Accuracy for challenges using this format
+  total: number;      // Total questions from this format
+}
+
 export interface BenchmarkResults {
   model: string;
   benchmarkVersion: string;
@@ -203,6 +212,7 @@ export interface BenchmarkResults {
   byHops: Record<string, { accuracy: number; meanConfidence: number; count: number }>;
   byDifficulty: Record<string, { accuracy: number; meanConfidence: number; count: number }>;
   bySplit?: Record<BenchmarkSplit, SplitSummary>;
+  byFormat?: Record<ParseFormat, FormatBreakdown>; // Breakdown by response format
   transferGap?: number; // |AA_real - AA_synthetic| — lower means synthetic predicts real well
   challengeScores: ChallengeScore[];
 }

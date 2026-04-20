@@ -206,6 +206,86 @@ function isErrorResponse(parsed: Record<string, any>): boolean {
 }
 
 /**
+ * Try to extract answers from DACR trace format with <|artifact|> block.
+ * Returns null if no artifact found.
+ */
+function tryParseTrace(raw: string, challenge: BenchmarkChallenge): Record<string, ModelAnswer> | null {
+  // Look for <|artifact|> block
+  const artifactMatch = raw.match(/<\|artifact\|>\s*([\s\S]*?)(?:<\|end|$)/);
+  if (!artifactMatch) return null;
+
+  const artifactText = artifactMatch[0].replace(/<\|artifact\|>\s*/, "").replace(/<\|end.*$/, "").trim();
+  if (!artifactText) return null;
+
+  // Extract citations from trace lines (> extract: ... | paragraph_N)
+  const citations: string[] = [];
+  const extractMatches = raw.matchAll(/>\s*extract:\s*[^|]+\|[^|]+\|[^|]+\|\s*(paragraph_\d+)/gi);
+  for (const m of extractMatches) {
+    citations.push(m[1]);
+  }
+  const citationStr = citations.slice(0, 3).join(", ") || "trace-derived";
+
+  const answers: Record<string, ModelAnswer> = {};
+
+  if (challenge.questions.length === 1) {
+    // Single question - entire artifact is the answer
+    answers[challenge.questions[0].questionId] = {
+      answer: artifactText,
+      citation: citationStr,
+      confidence: 0.7,
+    };
+    return answers;
+  }
+
+  // Multi-question - try to parse artifact structure
+  const lines = artifactText.split(/\n/).filter(l => l.trim());
+
+  for (const q of challenge.questions) {
+    const qNum = q.questionId.replace(/\D/g, "");
+    const patterns = [
+      new RegExp(`(?:q|Q|question)?\\s*${qNum}\\s*[:=]\\s*(.+)`, "i"),
+    ];
+
+    let found = false;
+    for (const line of lines) {
+      for (const pattern of patterns) {
+        const match = line.match(pattern);
+        if (match) {
+          answers[q.questionId] = {
+            answer: match[1].trim(),
+            citation: citationStr,
+            confidence: 0.6,
+          };
+          found = true;
+          break;
+        }
+      }
+      if (found) break;
+    }
+
+    if (!found) {
+      // Use positional mapping
+      const idx = challenge.questions.indexOf(q);
+      if (idx < lines.length) {
+        answers[q.questionId] = {
+          answer: lines[idx].trim(),
+          citation: citationStr,
+          confidence: 0.5,
+        };
+      } else {
+        answers[q.questionId] = {
+          answer: artifactText,
+          citation: citationStr,
+          confidence: 0.3,
+        };
+      }
+    }
+  }
+
+  return answers;
+}
+
+/**
  * Flexible answer extraction from unstructured text.
  * Looks for patterns like "q01: answer" or "1. answer" or numbered responses.
  * Falls back to extracting answer-like content per question.
@@ -275,14 +355,21 @@ function extractFromProse(
   return answers;
 }
 
+type ParseFormat = "json" | "trace" | "prose" | "failed";
+
+interface ParseResult {
+  answers: Record<string, ModelAnswer>;
+  format: ParseFormat;
+}
+
 /**
  * Parse model response with multi-strategy extraction.
- * Priority: JSON > flexible key matching > prose extraction
+ * Priority: JSON > DACR trace > prose extraction
  */
 function parseResponse(
   raw: string,
   challenge: BenchmarkChallenge
-): Record<string, ModelAnswer> {
+): ParseResult {
   // Strategy 1: Try strict JSON parse
   const parsed = tryParseJSON(raw);
 
@@ -312,17 +399,28 @@ function parseResponse(
       };
     }
 
-    if (foundAny) return answers;
+    if (foundAny) return { answers, format: "json" };
   }
 
-  // Strategy 2: Prose/freeform extraction
+  // Strategy 2: DACR trace format with <|artifact|>
+  const traceAnswers = tryParseTrace(raw, challenge);
+  if (traceAnswers) {
+    const traceFound = Object.values(traceAnswers).filter((a) => a.answer).length;
+    if (traceFound > 0) return { answers: traceAnswers, format: "trace" };
+  }
+
+  // Strategy 3: Prose/freeform extraction
   const proseAnswers = extractFromProse(raw, challenge);
   const proseFound = Object.values(proseAnswers).filter((a) => a.answer).length;
 
-  if (proseFound > 0) return proseAnswers;
+  if (proseFound > 0) return { answers: proseAnswers, format: "prose" };
 
-  // Strategy 3: Nothing worked
-  throw new Error("No answers extractable from response (tried JSON and prose parsing)");
+  // Strategy 4: Nothing worked
+  const emptyAnswers: Record<string, ModelAnswer> = {};
+  for (const q of challenge.questions) {
+    emptyAnswers[q.questionId] = { answer: "", citation: "", confidence: 0 };
+  }
+  return { answers: emptyAnswers, format: "failed" };
 }
 
 // ── Main Runner ──
@@ -386,8 +484,14 @@ export async function runBenchmark(config: RunConfig): Promise<ModelPrediction[]
 
     let answers: Record<string, ModelAnswer>;
     let formatFailures = 0;
+    let parseFormat: ParseFormat = "failed";
     try {
-      answers = parseResponse(raw, challenge);
+      const result = parseResponse(raw, challenge);
+      answers = result.answers;
+      parseFormat = result.format;
+      if (parseFormat === "failed") {
+        formatFailures = 1;
+      }
     } catch (e: any) {
       console.warn(`  PARSE FAILED: ${e.message}`);
       answers = {};
@@ -399,7 +503,8 @@ export async function runBenchmark(config: RunConfig): Promise<ModelPrediction[]
       ? Object.values(answers).reduce((s, a) => s + a.confidence, 0) / answeredCount
       : 0;
 
-    console.log(`  ${answeredCount}/${challenge.questions.length} answered, avg confidence: ${(avgConfidence * 100).toFixed(0)}%, ${elapsedSeconds.toFixed(1)}s`);
+    const formatLabel = parseFormat === "json" ? "JSON" : parseFormat === "trace" ? "TRACE" : parseFormat === "prose" ? "PROSE" : "FAIL";
+    console.log(`  ${answeredCount}/${challenge.questions.length} answered [${formatLabel}], avg confidence: ${(avgConfidence * 100).toFixed(0)}%, ${elapsedSeconds.toFixed(1)}s`);
 
     predictions.push({
       challengeId: challenge.challengeId,
@@ -411,6 +516,7 @@ export async function runBenchmark(config: RunConfig): Promise<ModelPrediction[]
         tokensGenerated: raw.length, // approximate
         temperature,
         formatFailures,
+        parseFormat,
       },
     });
   }

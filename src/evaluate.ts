@@ -17,6 +17,7 @@ import type {
   BenchmarkResults,
   SplitSummary,
   QuestionCategory,
+  ParseFormat,
 } from "./types.js";
 
 // ── Answer Matching ──
@@ -235,16 +236,33 @@ export function evaluate(
   const allQuestionScores: QuestionScore[] = [];
   let formatFailures = 0;
 
+  // Track format breakdown
+  const formatCounts: Record<ParseFormat, { count: number; correct: number; total: number }> = {
+    json: { count: 0, correct: 0, total: 0 },
+    trace: { count: 0, correct: 0, total: 0 },
+    prose: { count: 0, correct: 0, total: 0 },
+    failed: { count: 0, correct: 0, total: 0 },
+  };
+
   for (const challenge of challenges) {
     const pred = predMap.get(challenge.challengeId);
     if (!pred) {
       formatFailures++;
+      formatCounts.failed.count++;
       continue;
     }
+
+    // Track format used
+    const parseFormat: ParseFormat = pred.metadata?.parseFormat ?? "json";
+    formatCounts[parseFormat].count++;
 
     const score = scoreChallenge(challenge, pred);
     challengeScores.push(score);
     allQuestionScores.push(...score.questionScores);
+
+    // Track accuracy by format
+    formatCounts[parseFormat].total += score.questionScores.length;
+    formatCounts[parseFormat].correct += score.questionScores.filter(q => q.correct).length;
   }
 
   // Category breakdown
@@ -382,6 +400,28 @@ export function evaluate(
     byHops,
     byDifficulty,
     bySplit: Object.keys(bySplit).length > 0 ? bySplit as any : undefined,
+    byFormat: {
+      json: {
+        count: formatCounts.json.count,
+        accuracy: formatCounts.json.total > 0 ? formatCounts.json.correct / formatCounts.json.total : 0,
+        total: formatCounts.json.total,
+      },
+      trace: {
+        count: formatCounts.trace.count,
+        accuracy: formatCounts.trace.total > 0 ? formatCounts.trace.correct / formatCounts.trace.total : 0,
+        total: formatCounts.trace.total,
+      },
+      prose: {
+        count: formatCounts.prose.count,
+        accuracy: formatCounts.prose.total > 0 ? formatCounts.prose.correct / formatCounts.prose.total : 0,
+        total: formatCounts.prose.total,
+      },
+      failed: {
+        count: formatCounts.failed.count,
+        accuracy: 0,
+        total: 0,
+      },
+    },
     transferGap,
     challengeScores,
   };
@@ -406,6 +446,19 @@ export function generateReport(results: BenchmarkResults): string {
   report += `| Citation Grounding | ${(s.citationGroundingScore * 100).toFixed(1)}% |\n`;
   report += `| Challenge Pass Rate | ${(s.passRate * 100).toFixed(1)}% |\n`;
   report += `| Format Failure Rate | ${(s.formatFailureRate * 100).toFixed(1)}% |\n\n`;
+
+  // Format breakdown
+  if (results.byFormat) {
+    report += `## Response Format Breakdown\n\n`;
+    report += `*Shows how answers were extracted from model responses*\n\n`;
+    report += `| Format | Challenges | Questions | Accuracy |\n|---|---|---|---|\n`;
+    for (const [fmt, data] of Object.entries(results.byFormat)) {
+      if (data.count > 0) {
+        report += `| ${fmt.toUpperCase()} | ${data.count} | ${data.total} | ${(data.accuracy * 100).toFixed(1)}% |\n`;
+      }
+    }
+    report += `\n`;
+  }
 
   report += `## By Category\n\n`;
   report += `| Category | Accuracy | Confidence | Count |\n|---|---|---|---|\n`;
